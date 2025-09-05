@@ -1,0 +1,128 @@
+name: Build and Deploy PR Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull request number'
+        required: true
+        type: string
+      pr_action:
+        description: 'Pull request event action'
+        required: true
+        type: string
+      pr_sha:
+        description: 'Pull request head SHA'
+        required: true
+        type: string
+      source_repo:
+        description: 'Source repository (owner/repo)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}pr-${{ github.event.inputs.pr_number }}/
+    steps:
+      - name: Setup deployment info
+        run: |
+          echo "PR_NUMBER=${{ github.event.inputs.pr_number }}" >> $GITHUB_ENV
+          echo "PR_ACTION=${{ github.event.inputs.pr_action }}" >> $GITHUB_ENV
+          echo "SOURCE_REPO=${{ github.event.inputs.source_repo }}" >> $GITHUB_ENV
+          echo "PREVIEW_PATH=pr-${{ github.event.inputs.pr_number }}" >> $GITHUB_ENV
+
+      - name: Checkout PR preview repository
+        uses: actions/checkout@v4
+        with:
+          path: pr-preview-repo
+
+      - name: Checkout documentation PR
+        if: github.event.inputs.pr_action != 'closed'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.source_repo }}
+          ref: ${{ github.event.inputs.pr_sha }}
+          path: documentation
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: github.event.inputs.pr_action != 'closed'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: documentation/package-lock.json
+
+      - name: Download and setup Docforge
+        if: github.event.inputs.pr_action != 'closed'
+        working-directory: documentation
+        run: |
+          wget https://github.com/gardener/docforge/releases/download/v0.55.0/docforge-linux-amd64
+          mv docforge-linux-amd64 docforge
+          chmod +x docforge
+          DOCFORGE_CONFIG=.docforge/config.yaml GITHUB_OAUTH_TOKEN=${{ secrets.GITHUB_TOKEN }} ./docforge
+
+      - name: Install dependencies
+        if: github.event.inputs.pr_action != 'closed'
+        working-directory: documentation
+        run: npm ci
+
+      - name: Post-process content
+        if: github.event.inputs.pr_action != 'closed'
+        working-directory: documentation
+        run: npm run post-processing-all
+
+      - name: Build documentation
+        if: github.event.inputs.pr_action != 'closed'
+        working-directory: documentation
+        run: npm run docs:build
+        env:
+          VITE_PUBLIC_BASE_PATH: '/pr-preview/${{ env.PREVIEW_PATH }}/'
+
+      - name: Checkout gh-pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Deploy preview
+        if: github.event.inputs.pr_action != 'closed'
+        run: |
+          # Create preview directory
+          mkdir -p gh-pages/${{ env.PREVIEW_PATH }}
+          
+          # Copy built files to preview directory
+          cp -r documentation/.vitepress/dist/* gh-pages/${{ env.PREVIEW_PATH }}/
+          
+          # Commit and push changes
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "Deploy preview for PR #${{ env.PR_NUMBER }}"
+          git push
+
+      - name: Clean up preview
+        if: github.event.inputs.pr_action == 'closed'
+        run: |
+          cd gh-pages
+          
+          # Remove preview directory if it exists
+          if [ -d "${{ env.PREVIEW_PATH }}" ]; then
+            rm -rf ${{ env.PREVIEW_PATH }}
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add .
+            git commit -m "Remove preview for PR #${{ env.PR_NUMBER }}"
+            git push
+          else
+            echo "Preview directory does not exist"
+          fi
